@@ -11,18 +11,7 @@ require('dd-trace/init') // Only works with commonjs
 
 // Tracer code above must come before anything else
 const path = require('path')
-const {
-  KmsKeypair,
-  S3BlobStore,
-  CloudfrontInvalidator,
-} = require('@atproto/aws')
-const {
-  Database,
-  ServerConfig,
-  PDS,
-  ViewMaintainer,
-  makeAlgos,
-} = require('@atproto/pds')
+const { Database, DiskBlobStore, ServerConfig, PDS, ViewMaintainer, makeAlgos } = require('@atproto/pds')
 const { Secp256k1Keypair } = require('@atproto/crypto')
 
 const main = async () => {
@@ -36,6 +25,7 @@ const main = async () => {
     poolSize: 2,
   })
   await migrateDb.migrateToLatestOrThrow()
+  await migrateDb.close()
   // Use lower-credentialed user to run the app
   const db = Database.postgres({
     url: pgUrl(env.dbCreds),
@@ -44,20 +34,10 @@ const main = async () => {
     poolMaxUses: env.dbPoolMaxUses,
     poolIdleTimeoutMs: env.dbPoolIdleTimeoutMs,
   })
-  const s3Blobstore = new S3BlobStore({ bucket: env.s3Bucket })
+  const pdsBlobstore = new DiskBlobStore(env.blobStoreLoc, env.blobStoreTmp, null)
   const repoSigningKey = await Secp256k1Keypair.import(env.repoSigningKey)
-  const plcRotationKey = await KmsKeypair.load({
-    keyId: env.plcRotationKeyId,
-  })
-  let recoveryKey
-  if (env.recoveryKeyId.startsWith('did:')) {
-    recoveryKey = env.recoveryKeyId
-  } else {
-    const recoveryKeypair = await KmsKeypair.load({
-      keyId: env.recoveryKeyId,
-    })
-    recoveryKey = recoveryKeypair.did()
-  }
+  const plcRotationKey = await Secp256k1Keypair.create()
+  let recoveryKey = env.recoveryKeyId
   const cfg = ServerConfig.readEnv({
     port: env.port,
     recoveryKey,
@@ -66,6 +46,11 @@ const main = async () => {
       username: env.smtpUsername,
       password: env.smtpPassword,
     }),
+    publicUrl: env.publicUrl,
+    imgUrlEndpoint: env.imgUrlEndpoint,
+    imgUriSalt: env.imgUrlSalt,
+    imgUriKey: env.imgUrlKey,
+    blobCacheLocation: env.blobChacheLoc,
   })
   const cfInvalidator = new CloudfrontInvalidator({
     distributionId: env.cfDistributionId,
@@ -74,12 +59,12 @@ const main = async () => {
   const algos = env.feedPublisherDid ? makeAlgos(env.feedPublisherDid) : {}
   const pds = PDS.create({
     db,
-    blobstore: s3Blobstore,
+    blobstore: pdsBlobstore,
     repoSigningKey,
     plcRotationKey,
     config: cfg,
-    imgInvalidator: cfInvalidator,
     algos,
+    imgInvalidator: null,
   })
   const viewMaintainer = new ViewMaintainer(migrateDb)
   const viewMaintainerRunning = viewMaintainer.run()
@@ -93,18 +78,9 @@ const main = async () => {
   })
 }
 
-const pgUrl = ({
-  username = 'postgres',
-  password = 'postgres',
-  host = '0.0.0.0',
-  port = '5432',
-  database = 'postgres',
-  sslmode,
-}) => {
+const pgUrl = ({ username, password, host, port }) => {
   const enc = encodeURIComponent
-  return `postgresql://${username}:${enc(
-    password,
-  )}@${host}:${port}/${database}${sslmode ? `?sslmode=${enc(sslmode)}` : ''}`
+  return `postgresql://${username}:${enc(password)}@${host}:${port}/postgres`
 }
 
 const smtpUrl = ({ username, password, host }) => {
@@ -132,6 +108,13 @@ const getEnv = () => ({
   smtpUsername: process.env.SMTP_USERNAME,
   smtpPassword: process.env.SMTP_PASSWORD,
   s3Bucket: process.env.S3_BUCKET_NAME,
+  blobStoreLoc: process.env.BLOBSTORE_LOC,
+  blobStoreTmp: process.env.BLOBSTORE_TMP,
+  blobChacheLoc: process.env.BLOB_CACHE_LOC,
+  publicUrl: process.env.PUBLIC_URL,
+  imgUrlEndpoint: process.env.IMG_URL_ENDPOINT,
+  imgUrlSalt: process.env.IMG_URI_SALT,
+  imgUrlKey: process.env.IMG_URI_KEY,
   cfDistributionId: process.env.CF_DISTRIBUTION_ID,
   feedPublisherDid: process.env.FEED_PUBLISHER_DID,
 })
